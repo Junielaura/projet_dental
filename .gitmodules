@@ -1,0 +1,6 @@
+[submodule "backend_robot"]
+	path = backend_robot
+	url = https://github.com/Junielaura/backend_robot.git
+[submodule "frontend_robot"]
+	path = frontend_robot
+	url = https://github.com/Junielaura/frontend_robot.git
