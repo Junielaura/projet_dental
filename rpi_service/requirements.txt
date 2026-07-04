@@ -1,0 +1,6 @@
+redis==5.0.8
+requests==2.32.3
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+pyserial==3.5
+tflite-runtime==2.14.0
