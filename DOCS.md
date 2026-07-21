@@ -106,6 +106,38 @@
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Schéma de déploiement (3 repos liés par sous-modules)
+
+```
+projet_dental/              ← Meta-repo (sous-modules Git)
+├── DOCS.md                 # Documentation centrale
+├── ARCHITECTURE.md         # Architecture complète
+├── backend_robot/          ← Sous-module
+│   ├── app/                # Flask API (blueprints, models, middleware)
+│   ├── rpi_service/        # Orchestrateur RPi (5 threads, TFLite, GradCAM)
+│   ├── migrations/         # Alembic (4 versions)
+│   ├── scripts/            # ssl-setup, update, backup
+│   ├── contrib/fail2ban/   # Filtres de sécurité
+│   ├── nginx.conf          # Reverse proxy + HTTPS/WSS
+│   └── docker-compose.yml  # 8 services
+├── frontend_robot/         ← Sous-module
+│   ├── src/app/            # App Router (dashboard, scan, patients...)
+│   ├── src/components/     # Wizard 6 phases, Viewer 3 colonnes
+│   ├── src/hooks/          # useWebSocket, useAutomaticCapture...
+│   └── src/store/          # Zustand (26 actions / 30 champs)
+```
+
+### Pipeline IA complet (6 étapes WebSocket)
+
+L'inférence TFLite sur RPi publie sa progression via le namespace `/inference` :
+
+1. `preprocessing` — Resize 640×640 + normalize + CLAHE
+2. `detection` — YOLOv8 segmentation (dents, caries, plaque)
+3. `classification` — EfficientNetV2 (4 classes, softmax)
+4. `gradcam` — Heatmap overlay + contours + suspect_regions
+5. `fusion` — Fusion IA + capteurs (pH, humidité, distance) + historique patient
+6. `complete` — Résultat final avec recommandations
+
 ### Stack technique
 
 | Couche | Technologie | Version |
@@ -410,10 +442,11 @@ frontend_robot/
 │   │       ├── reports/          # Rapports PDF
 │   │       ├── users/            # Gestion utilisateurs
 │   │       ├── settings/         # Profil, thème
+│   │       ├── notifications/    # Liste notifications (pagination, lire, supprimer)
 │   │       └── docs/             # Documentation API Swagger
 │   ├── components/
 │   │   ├── ui/                   # Shadcn UI (18 composants)
-│   │   ├── layout/               # DashboardLayout, Sidebar, Header
+│   │   ├── layout/               # DashboardLayout, Sidebar, Header, NotificationPanel
 │   │   ├── common/               # PageHeader, StatusBadge, Skeleton, EmptyState
 │   │   ├── diagnostics/          # 16 composants du Diagnostic Viewer
 │   │   │   ├── wizard-stepper.tsx
@@ -446,7 +479,7 @@ frontend_robot/
 │   │   ├── charts/
 │   │   ├── data-table/
 │   │   └── monitoring/
-│   ├── hooks/                    # 8 hooks custom
+│   ├── hooks/                    # 9 hooks custom
 │   │   ├── use-auth.ts
 │   │   ├── use-hardware-check.ts
 │   │   ├── use-pre-scan-check.ts
@@ -456,10 +489,22 @@ frontend_robot/
 │   │   ├── use-sensor-data.ts
 │   │   ├── use-pdf-report.ts
 │   │   ├── use-socket.ts
+│   │   ├── use-notification-socket.ts  # WebSocket /notifications en temps réel
 │   │   └── use-permissions.ts
-│   ├── stores/                   # Zustand : auth, session, sidebar, theme
+│   ├── stores/                   # Zustand : auth, session, sidebar, theme, notifications
 │   ├── lib/
-│   │   ├── api/                  # 9 modules API (axios)
+│   │   ├── api/                  # 10 modules API (axios)
+│   │   │   ├── client.ts         # Axios instance + intercepteur JWT
+│   │   │   ├── auth.api.ts
+│   │   │   ├── patients.api.ts
+│   │   │   ├── diagnostics.api.ts
+│   │   │   ├── scan.api.ts
+│   │   │   ├── hardware.api.ts
+│   │   │   ├── monitoring.api.ts
+│   │   │   ├── reports.api.ts
+│   │   │   ├── users.api.ts
+│   │   │   ├── notifications.api.ts  # Liste, unread-count, markRead, delete
+│   │   │   └── dashboard.api.ts
 │   │   ├── utils.ts              # cn(), formatDate(), getConfidenceColor()
 │   │   ├── constants.ts          # Rôles, status, maladies
 │   │   └── mock-diagnostic.ts    # Données mockées
@@ -522,55 +567,97 @@ pip install --break-system-packages \
 # Le système fonctionne en mode dégradé sans TFLite
 ```
 
-### 5.3 Configuration du service systemd
+### 5.3 Déploiement automatisé avec `deploy.sh`
+
+Le script `rpi_service/deploy.sh` automatise l'intégralité du déploiement en 12 étapes :
 
 ```bash
-sudo nano /etc/systemd/system/dental-ai.service
+sudo bash /home/pi/backend_robot/rpi_service/deploy.sh
 ```
 
-```ini
-[Unit]
-Description=Dental AI - Raspberry Pi Service
-After=network.target redis-server.service
+**Étapes :**
+1. Vérification Raspberry Pi 5
+2. Installation packages système (Python, Redis, PostgreSQL, Nginx, V4L2, OpenCV, fail2ban, certbot)
+3. Activation + démarrage Redis
+4. Création base et utilisateur PostgreSQL (`dental_user` / `dental_db`)
+5. Clonage ou mise à jour du backend depuis GitHub
+6. Environnement virtuel Python + dépendances (avec fallback mock TFLite)
+7. Création des dossiers (`captures/`, `uploads/`, `logs/`, `models/`)
+8. Génération du fichier `.env` avec secrets aléatoires
+9. Copie des 4 services systemd + activation
+10. Migrations base de données + seed admin
+11. Démarrage des services
+12. Tests de vérification (API, Redis, caméra, Arduino)
 
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/backend_robot
-Environment=REDIS_HOST=localhost
-Environment=REDIS_PORT=6379
-Environment=API_URL=http://localhost:5000/api
-Environment=CAPTURE_DIR=/home/pi/captures
-Environment=ARDUINO_PORT=/dev/ttyACM0
-Environment=ARDUINO_BAUD=115200
-ExecStart=/usr/bin/python3 /home/pi/backend_robot/rpi_service/dental_service.py
-Restart=always
-RestartSec=10
+### 5.4 Services systemd
 
-[Install]
-WantedBy=multi-user.target
-```
+4 services installés automatiquement par `deploy.sh` :
+
+| Service | Fichier | Description |
+|---------|---------|-------------|
+| `dental-ai` | `rpi_service/systemd/dental-ai.service` | Orchestrateur RPi (5 threads, CPUAffinity 0-3) |
+| `dental-flask` | `rpi_service/systemd/dental-flask.service` | API Flask (gunicorn 2 workers) |
+| `dental-celery` | `rpi_service/systemd/dental-celery.service` | Celery worker (2 workers, 1000 taches max) |
+| `dental-celery-beat` | `rpi_service/systemd/dental-celery-beat.service` | Celery beat scheduler |
+
+**Fonctionnalités :**
+- `dental-ai.service` : watchdog + CPU pinning + `SCHED_FIFO` (caméra 50, sensors 40) + restart policy 10s/5 tentatives
+- `dental-flask.service` : migration Redis ping via `ExecStartPre`, workers synchrones `--preload`
+- Tous les services : `ProtectSystem=full`, `PrivateTmp=true`, `NoNewPrivileges=true`
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable dental-ai.service
-sudo systemctl start dental-ai.service
-sudo systemctl status dental-ai.service
+# Gestion des services
+sudo systemctl status dental-ai
+sudo journalctl -u dental-ai -f
+sudo systemctl restart dental-ai
+sudo systemctl stop dental-ai
 ```
 
-### 5.4 Configuration du backend Flask sur RPi
+### 5.5 Backend Flask + Celery sur RPi
 
 ```bash
-# Option 1 : Directement sur le RPi
-pip install --break-system-packages -r requirements.txt
-flask db upgrade
-gunicorn --bind 0.0.0.0:5000 --workers 2 wsgi:app
+# Option 1 : Directement sur le RPi (via systemd)
+sudo systemctl start dental-flask
+sudo systemctl start dental-celery
+sudo systemctl start dental-celery-beat
 
-# Option 2 : Docker (recommandé)
+# Option 2 : Docker (recommandé multi-serveur)
 docker compose up -d
 ```
 
-### 5.5 Connexions matérielles
+**Tâches Celery planifiées (beat) :**
+
+| Tâche | Fréquence | Description |
+|-------|-----------|-------------|
+| `check_system_health` | Toutes les 5 min | Vérifie PostgreSQL, CPU, mémoire, température |
+| `cleanup_old_data` | Chaque jour à 3h | Supprime sessions > 30 jours + logs santé > 7 jours |
+| `backup_database` | Chaque dimanche à 4h | pg_dump → compression gzip → `/home/pi/backups/` |
+
+### 5.6 Scripts utilitaires
+
+| Fichier | Description |
+|---------|-------------|
+| `scripts/ssl-setup.sh` | Configuration Let's Encrypt + auto-renew crontab |
+| `scripts/update.sh` | git pull → deps → migrations → restart services |
+| `scripts/backup.sh` | Backup complet (DB + uploads + captures + config) + rétention 14 jours |
+
+```bash
+# SSL pour le domaine
+sudo bash scripts/ssl-setup.sh api.dental-ai.com
+
+# Mise à jour
+sudo bash scripts/update.sh
+
+# Sauvegarde manuelle
+sudo bash scripts/backup.sh
+```
+
+Fail2ban est configuré avec 3 jails :
+- `sshd` : 3 échecs → bannissement 24h
+- `nginx-http-auth` : 5 échecs → 1h
+- `dental-api` : 10 échecs en 5 min → 1h (filtre regex personnalisé)
+
+### 5.7 Connexions matérielles
 
 ```
 Arduino Uno R4 ←→ Raspberry Pi 5 (USB /dev/ttyACM0)
@@ -585,14 +672,17 @@ Arduino Uno R4 ←→ Raspberry Pi 5 (USB /dev/ttyACM0)
 Caméra intra-orale USB ←→ Raspberry Pi 5 (USB /dev/video0)
 ```
 
-### 5.6 Vérification du déploiement
+### 5.8 Vérification du déploiement
 
 ```bash
-# 1. Vérifier le service
-sudo systemctl status dental-ai.service
+# 1. Vérifier les services
+sudo systemctl status dental-ai
+sudo systemctl status dental-flask
+sudo systemctl status dental-celery
 
 # 2. Vérifier les logs
-journalctl -u dental-ai.service -f
+journalctl -u dental-ai -f
+journalctl -u dental-flask -f
 
 # 3. Vérifier Redis
 redis-cli ping  # → PONG
@@ -601,6 +691,9 @@ redis-cli ping  # → PONG
 curl http://localhost:5000/api/health
 # → {"status":"ok","message":"Dental AI Diagnostic API is running"}
 
+curl http://localhost:5000/api/system/health -H "Authorization: Bearer <token>"
+# → {"status":"healthy","components":{"postgresql":{"status":"ok"},"redis":{"status":"ok"},...}}
+
 # 5. Vérifier les capteurs Arduino
 cat /dev/ttyACM0 &
 # → {"ph":6.8,"temp":36.2,"dist":12,"press":0.3,"hum":62,"tip":1}
@@ -608,6 +701,12 @@ cat /dev/ttyACM0 &
 # 6. Vérifier la caméra
 v4l2-ctl --list-devices
 # → devrait montrer la caméra intra-orale
+
+# 7. Vérifier Flower (monitoring Celery)
+# http://localhost:5555 (auth basic : voir nginx.conf)
+
+# 8. Vérifier les backups
+ls -la /home/pi/backups/
 ```
 
 ---
@@ -618,12 +717,14 @@ v4l2-ctl --list-devices
 
 ```yaml
 services:
-  postgres:     # PostgreSQL 16 Alpine
-  redis:        # Redis 7 Alpine
-  backend:      # Flask + Gunicorn
-  celery_worker:# Celery worker (tâches async)
-  celery_beat:  # Celery beat (tâches planifiées)
-  flower:       # Monitoring Celery (port 5555)
+  postgres:       # PostgreSQL 16 Alpine
+  redis:          # Redis 7 Alpine
+  backend:        # Flask + Gunicorn
+  celery_worker:  # Celery worker (tâches async)
+  celery_beat:    # Celery beat (tâches planifiées)
+  flower:         # Monitoring Celery (port 5555)
+  frontend:       # Next.js 15 standalone
+  nginx:          # Reverse proxy + TLS + rate limiting
 ```
 
 ### Commandes utiles
@@ -647,7 +748,18 @@ docker compose exec backend python manage.py create_admin
 ./scripts/migrate.sh backend upgrade   # Appliquer
 
 # Monitoring Celery
-# Flower : http://localhost:5555
+# Flower : http://localhost:5555 (auth basic définie dans nginx.conf)
+
+# Accès via nginx
+# API :  http://localhost/api/*
+# Frontend : http://localhost/
+# WebSocket : ws://localhost/socket.io/
+#   Namespaces :
+#     /camera        → flux vidéo, zoom, capture
+#     /sensors       → données capteurs temps réel
+#     /inference     → progression pipeline IA (7 étapes)
+#     /notifications → push notifications utilisateur en temps réel
+# Flower : http://localhost/flower/
 
 # Arrêter
 docker compose down
@@ -751,10 +863,26 @@ Les 6 critères de qualité (blur, brightness, contrast, noise, motion, glare) s
 | `sensor_snapshot` | `JSON` | état capteurs au moment capture |
 | `created_at` | `DATETIME` | default now() |
 
+#### `system_health_log` (monitoring watchdog)
+| Colonne | Type | Contrainte |
+|---------|------|------------|
+| `id` | `INTEGER` | PK, auto-incrément |
+| `component` | `VARCHAR(64)` | NOT NULL, INDEX |
+| `status` | `VARCHAR(20)` | NOT NULL (ok/warning/critical/error/disconnected) |
+| `cpu_percent` | `FLOAT` | nullable |
+| `temp_celsius` | `FLOAT` | nullable |
+| `mem_percent` | `FLOAT` | nullable |
+| `disk_free_bytes` | `BIGINT` | nullable |
+| `fps_current` | `FLOAT` | nullable |
+| `inference_time_ms` | `FLOAT` | nullable |
+| `error_message` | `TEXT` | nullable |
+| `checked_at` | `DATETIME` | NOT NULL, INDEX, default now() |
+
 ### Relations
 
 ```
 scan_sessions 1───* scan_captures 1───1 scan_results
+system_health_log (indépendant — logs de monitoring)
 ```
 
 - `scan_sessions` → *`scan_captures`* : une session contient N captures
@@ -772,8 +900,18 @@ scan_sessions 1───* scan_captures 1───1 scan_results
 | `scan_captures` | `ix_scan_captures_session_id` | `session_id` | B-tree |
 | `scan_captures` | `ix_scan_captures_quality_score` | `quality_score` | B-tree |
 | `scan_results` | `ix_scan_results_capture_id` | `capture_id` | UNIQUE B-tree |
+| `system_health_log` | `ix_system_health_log_component` | `component` | B-tree |
+| `system_health_log` | `ix_system_health_log_checked_at` | `checked_at` | B-tree |
 
-### Migration
+### Migrations disponibles
+
+| Fichier | Description |
+|---------|-------------|
+| `a08e3e9e3524_initial_migration.py` | Tables initiales (users, patients, diagnostics, monitoring) |
+| `b2c4f8e6d0a2_add_scan_session_models.py` | Tables scan (sessions, captures, results avec FK cascade + indexes) |
+| `e7f1a2b3c4d5_add_system_health_log.py` | Table system_health_log (monitoring watchdog + indexes) |
+
+### Commandes
 
 ```bash
 # Générer une nouvelle migration après modification des modèles
@@ -784,6 +922,9 @@ docker compose exec backend flask db upgrade
 
 # Annuler la dernière migration
 docker compose exec backend flask db downgrade
+
+# Voir l'historique
+docker compose exec backend flask db history
 ```
 
 ---
@@ -825,12 +966,17 @@ GET    /api/diagnostics/stats        # Statistiques
 ### Scan
 
 ```
-GET    /api/hardware/status          # État du matériel
-GET    /api/scan/check-conditions    # Vérifications pré-scan
-POST   /api/scan/session/start       # Démarrer session
-POST   /api/scan/capture             # Capturer image
-POST   /api/scan/analyze/:id         # Analyser image
-GET    /api/scan/progress/:id        # Progression
+GET    /api/hardware/status                   # État du matériel
+GET    /api/scan/check-conditions             # Vérifications pré-scan → { checks: CheckCondition[], all_passed, timestamp }
+POST   /api/scan/session/start                # Démarrer session → ScanSession
+GET    /api/scan/session/:id                  # Récupérer une session
+POST   /api/scan/session/:id/complete         # Terminer une session
+POST   /api/scan/session/:id/cancel           # Annuler une session
+POST   /api/scan/capture                      # Capturer image → ScanCapture
+POST   /api/scan/analyze/:capture_id          # Analyser image → { result: ScanResult }
+GET    /api/scan/result/:capture_id           # Résultat IA d'une capture
+GET    /api/scan/progress/:session_id         # Progression session
+GET    /api/scan/progress/capture/:capture_id # Progression d'une capture
 ```
 
 ### Capteurs (Monitoring)
@@ -883,6 +1029,89 @@ GET    /api/dashboard/stats          # Statistiques agrégées
 GET    /api/audit                    # Journal d'audit
 ```
 
+### Système (Monitoring interne)
+
+```
+GET    /api/system/health            # État global des composants (postgres, redis, cpu, mem, temp)
+GET    /api/system/health/detail     # Derniers 60 logs de santé détaillés
+GET    /api/system/monitoring        # Logs paginés (filtres : component, status)
+POST   /api/system/cleanup           # Nettoyage manuel (sessions > 30j, logs > 7j) [admin]
+```
+
+Ces endpoints sont sécurisés par JWT. Les routes système sont protégées par rôle admin. Le `/api/system/health` est accessible à tout utilisateur authentifié pour le monitoring temps réel.
+
+### API Documentation Interactive (Swagger)
+
+Le frontend embarque une page **Documentation API** à l'URL `/dashboard/docs` qui affiche Swagger UI via une iframe pointant vers `/apidocs/` (Flasgger côté backend).
+
+**Fonctionnement :**
+- **Backend** : Flasgger sert l'UI Swagger sur `http://<backend>:5000/apidocs/`
+- **Nginx** : La location `/apidocs/` proxyfie vers le backend (ajoutée aux 2 server blocks)
+- **Frontend** : L'iframe utilise `NEXT_PUBLIC_APIDOCS_URL` (variable d'env, défaut `http://localhost:5000/apidocs/` en dev)
+- **Sécurité** : `X-Frame-Options` est supprimé pour `/apidocs/` via nginx ; Flask fait de même dans le middleware `SecurityMiddleware`
+- **CSP** : Le Content-Security-Policy de nginx autorise `frame-src 'self'` pour le chargement de l'iframe
+
+**Configuration :**
+```bash
+# .env.local (frontend)
+NEXT_PUBLIC_APIDOCS_URL=/apidocs/   # via nginx (production)
+NEXT_PUBLIC_APIDOCS_URL=http://localhost:5000/apidocs/  # direct backend (développement)
+```
+
+### Notifications temps réel
+
+Le système de notifications est entièrement dynamique et temps réel.
+
+**Architecture :**
+
+```
+Analyse IA terminée (scan/routes.py)
+  │
+  ▼
+NotificationService.create()
+  ├── Enregistre en BDD (table `notifications`)
+  └── Emet WebSocket → emit_notification(user_id, payload)
+                           │
+                           ▼
+                  NotificationNamespace("/notifications")
+                           │
+                  socketio.emit("new_notification", ..., room=f"notif_{user_id}")
+                           │
+                           ▼ (WebSocket)
+                  useNotificationSocket() (frontend)
+                           │
+                           ▼
+                  notification.store → addRealtime()
+                           │
+                  ┌─────────┴──────────┐
+                  ▼                    ▼
+            Header (badge +1)   NotificationPanel (liste)
+```
+
+**Backend :**
+- **Modèle** : `Notification` (user_id, type, title, message, link, is_read, created_at)
+- **Service** : `NotificationService` (create, get_unread_count, get_user_notifications, mark_read, mark_all_read, delete)
+- **API REST** : 5 endpoints sous `/api/notifications`
+- **WebSocket** : Namespace `/notifications` — chaque utilisateur rejoint `notif_{user_id}` à la connexion
+- **Types** : `diagnostic_created`, `diagnostic_analyzed`, `report_ready`, `system_alert`, `appointment_reminder`
+- **Création automatique** : la route `POST /api/scan/analyze/:id` crée une notification `diagnostic_analyzed` après chaque analyse
+
+**Frontend :**
+| Fichier | Rôle |
+|---------|------|
+| `lib/api/notifications.api.ts` | Client Axios (list, unread-count, markRead, markAllRead, delete) |
+| `stores/notification.store.ts` | Store Zustand (items, unreadCount, fetch poll 30s, addRealtime) |
+| `hooks/use-notification-socket.ts` | Connexion WebSocket `/notifications` avec token JWT |
+| `components/layout/notification-panel.tsx` | Dropdown : liste, marquer lu, supprimer, lien, date relative |
+| `components/layout/header.tsx` | Badge dynamique, ouvre le panel au clic |
+| `app/dashboard/notifications/page.tsx` | Page complète avec pagination, actions batch |
+
+**Environnement :**
+```bash
+# .env.local (frontend)
+NEXT_PUBLIC_WS_URL=http://localhost:5000  # URL de base Socket.IO (défaut)
+```
+
 ---
 
 ## 8. Dépannage
@@ -897,9 +1126,15 @@ GET    /api/audit                    # Journal d'audit
 | JWT invalide | Token expiré | Rafraîchir via `/auth/refresh` |
 | 429 Too Many Requests | Rate limit | Attendre 1 minute |
 | 500 Internal Error | Erreur serveur | Vérifier `docker compose logs backend` |
+| Documentation API vide (iframe blanc) | URL hardcodée `localhost:5000` inaccessible ou CSP/X-Frame-Options bloque | Vérifier que `NEXT_PUBLIC_APIDOCS_URL` pointe vers `/apidocs/` via nginx ; s'assurer que nginx a la location `/apidocs/` et que `X-Frame-Options` est levé | |
 | WebSocket déconnecté | Proxy manquant | Vérifier Nginx / CORS |
+| Notifications non reçues en temps réel | WebSocket `/notifications` déconnecté | Vérifier que `NEXT_PUBLIC_WS_URL` est correct et que le token JWT est valide ; `docker compose logs backend` pour voir la connexion |
 | Image qualité < 60 | Mauvaise luminosité | Ajuster éclairage / position |
-| TFLite non chargé | Modèle manquant | Vérifier `models/dentalnet_v2_uint8.tflite` |
+| TFLite non chargé | Modèle manquant | Vérifier `models/multimodal_model.tflite` et `models/unet_model.tflite` |
+| Service systemd en échec | Dépendance manquante | `journalctl -u dental-ai -f` pour le diagnostic |
+| Celery beat ne tourne pas | Redis injoignable | `systemctl status dental-celery-beat` |
+| Backup échoue | pg_dump non installé | `sudo apt install postgresql-client` |
+| Certbot SSL échec | Domaine non résolu | Vérifier DNS A record → IP du RPi |
 
 ### Logs
 
